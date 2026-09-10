@@ -69,6 +69,10 @@ AUTH_SESSION_TTL_SEC = max(300, int(os.environ.get("DEV_AUTH_SESSION_TTL_SEC", "
 AUTH_COOKIE_SECURE = _env_bool("DEV_AUTH_COOKIE_SECURE", True)
 AUTH_RATE_LIMIT_PER_IP = 5
 AUTH_RATE_LIMIT_WINDOW_SEC = 900
+PARKING_AUTH_KEYWORDS = (
+    "停車", "停車場", "停车", "停车场", "附近", "優惠", "优惠",
+    "信用卡", "卡友", "車位", "车位", "免費停車", "免费停车",
+)
 
 _ip_requests = defaultdict(deque)
 _auth_requests = defaultdict(deque)
@@ -298,6 +302,11 @@ def _request_card_ids():
     return AUTH_CARD_IDS if AUTH_CARD_IDS else None
 
 
+def _requires_parking_auth(message: str):
+    text = str(message or "").casefold()
+    return any(keyword.casefold() in text for keyword in PARKING_AUTH_KEYWORDS)
+
+
 @app.get("/api/auth/status")
 def api_auth_status(request: Request):
     session = _read_session(request)
@@ -380,11 +389,20 @@ def api_nearby(request: Request, lat: float, lng: float, radius_km: float = 3.0,
 
 @app.post("/api/chat")
 async def api_chat(request: Request):
-    guard = _auth_guard(request)
-    if guard:
-        return guard
     body = await request.json()
     message = (body.get("message") or "")[:MAX_MESSAGE_LEN]
+
+    if _requires_parking_auth(message):
+        guard = _auth_guard(request)
+        if guard:
+            return guard
+    else:
+        return JSONResponse({
+            "reply": "嗨！我可以協助您查詢停車場與信用卡停車優惠。當您要查詢附近場站或優惠資格時，我會再請您完成身分驗證。",
+            "lots": None,
+            "need_geolocation": False,
+        })
+
     ip = request.client.host if request.client else "unknown"
 
     ok, err = _check_rate_limit(ip)
@@ -572,10 +590,10 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="app">
   <header>
     <h1>🅿️ 信用卡停車優惠小助理</h1>
-    <p>完成開發測試認證後，依測試帳號對應的卡別查詢附近停車優惠。</p>
+    <p>可以先對話；當您要查詢附近停車場或信用卡優惠時，再完成開發測試認證。</p>
   </header>
 
-  <section class="auth-panel" id="authPanel">
+  <section class="auth-panel" id="authPanel" style="display:none">
     <h2>開發測試認證</h2>
     <p>身分證字號與驗證碼只用於本次測試驗證，不會顯示在聊天內容中。</p>
     <form class="auth-form" id="authForm">
@@ -614,6 +632,9 @@ const logoutBtn = document.getElementById('logoutBtn');
 const authStatusEl = document.getElementById('authStatus');
 let authenticated = false;
 let authRequired = true;
+let pendingQuery = null;
+let pendingQueryAlreadyShown = false;
+const PARKING_QUERY_KEYWORDS = ['停車', '停車場', '停车', '停车场', '附近', '優惠', '优惠', '信用卡', '卡友', '車位', '车位', '免費停車', '免费停车'];
 
 function escapeHtml(s) {
   const d = document.createElement('div');
@@ -659,6 +680,7 @@ function setAuthStatus(text, isError = false) {
 }
 
 function showAuthenticated() {
+  authPanel.style.display = '';
   authForm.style.display = 'none';
   logoutBtn.style.display = 'inline-block';
   setAuthStatus('已完成開發測試認證，可以查詢符合測試卡別的優惠。');
@@ -666,10 +688,23 @@ function showAuthenticated() {
 }
 
 function showLogin(message) {
+  authPanel.style.display = '';
   authForm.style.display = '';
   logoutBtn.style.display = 'none';
   setAuthStatus(message || '請先完成開發測試認證。', !!message);
-  setQueryEnabled(false);
+  setQueryEnabled(true);
+}
+
+function hideAuthPrompt() {
+  authPanel.style.display = 'none';
+  authForm.style.display = '';
+  logoutBtn.style.display = 'none';
+  setAuthStatus('');
+}
+
+function isParkingQuery(text) {
+  const normalized = String(text || '').toLocaleLowerCase();
+  return PARKING_QUERY_KEYWORDS.some(keyword => normalized.includes(keyword.toLocaleLowerCase()));
 }
 
 async function loadStats() {
@@ -707,10 +742,15 @@ async function refreshAuth() {
       addMessage('assistant', '驗證已生效！可以告訴我地點，或說「附近」查詢符合測試卡別的停車優惠。');
       loadStats();
     } else {
-      showLogin('請先完成開發測試認證。');
+      authenticated = false;
+      hideAuthPrompt();
+      setQueryEnabled(true);
+      addMessage('assistant', '嗨！可以先和我對話；當您要查詢停車場或信用卡停車優惠時，我會再請您完成身分驗證。');
     }
   } catch (e) {
-    showLogin('無法確認認證狀態，請稍後再試。');
+    hideAuthPrompt();
+    setQueryEnabled(true);
+    addMessage('assistant', '嗨！可以先告訴我您想了解的內容；若要查詢停車優惠，稍後會需要完成身分驗證。');
   }
 }
 
@@ -735,6 +775,13 @@ authForm.addEventListener('submit', async (e) => {
     showAuthenticated();
     addMessage('assistant', data.reply || '驗證成功，現在可以查詢停車優惠。');
     loadStats();
+    if (pendingQuery) {
+      const retry = pendingQuery;
+      const alreadyShown = pendingQueryAlreadyShown;
+      pendingQuery = null;
+      pendingQueryAlreadyShown = false;
+      sendMessage(retry, alreadyShown);
+    }
   } catch (e) {
     showLogin('驗證服務暫時無法使用，請稍後再試。');
   } finally {
@@ -745,7 +792,11 @@ authForm.addEventListener('submit', async (e) => {
 logoutBtn.addEventListener('click', async () => {
   await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
   authenticated = false;
-  showLogin('已登出，請重新完成開發測試認證。');
+  pendingQuery = null;
+  pendingQueryAlreadyShown = false;
+  hideAuthPrompt();
+  setQueryEnabled(true);
+  addMessage('assistant', '已登出。您仍可以先對話；下次查詢停車優惠時會再要求驗證。');
 });
 
 function renderCardsInto(bubble, lots) {
@@ -835,13 +886,15 @@ function requestGeolocation() {
   }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 });
 }
 
-async function sendMessage(text) {
+async function sendMessage(text, skipUserBubble = false) {
   if (!text.trim()) return;
-  if (authRequired && !authenticated) {
-    showLogin('請先完成開發測試認證。');
+  if (!skipUserBubble && authRequired && !authenticated && isParkingQuery(text)) {
+    pendingQuery = text;
+    pendingQueryAlreadyShown = false;
+    showLogin('這項查詢會顯示停車場優惠，請先完成身分證字號與驗證碼認證。');
     return;
   }
-  addMessage('user', text);
+  if (!skipUserBubble) addMessage('user', text);
   inputEl.value = '';
   sendBtn.disabled = true;
   addTyping();
@@ -855,6 +908,8 @@ async function sendMessage(text) {
     removeTyping();
     if (res.status === 401 || res.status === 503) {
       authenticated = false;
+      pendingQuery = text;
+      pendingQueryAlreadyShown = true;
       showLogin(data.reply || '請先完成開發測試認證。');
       return;
     }
