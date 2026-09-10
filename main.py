@@ -11,6 +11,9 @@ import json
 import os
 import time
 import re
+import base64
+import hashlib
+import hmac
 from collections import defaultdict, deque
 from math import radians, cos, sin, asin, sqrt
 
@@ -46,7 +49,29 @@ RATE_LIMIT_WINDOW_SEC = 600    # 時間窗口（秒）
 DAILY_GLOBAL_LIMIT = 300       # 整個服務每天的 LLM 呼叫總上限（保護 API 額度）
 MAX_MESSAGE_LEN = 200          # 單則訊息最大字數，避免塞入超長文字拉高成本
 
+# ---- 開發測試認證 ----
+# 只接受雜湊後的測試資料；不在程式碼、cookie、log 或資料檔保存明文身分證字號/驗證碼。
+
+def _env_bool(name, default=False):
+    return os.environ.get(name, str(default)).strip().lower() in ("1", "true", "yes", "on")
+
+
+AUTH_REQUIRED = _env_bool("AUTH_REQUIRED", True)
+AUTH_SESSION_SECRET = os.environ.get("DEV_AUTH_SESSION_SECRET", "")
+AUTH_ID_SHA256 = os.environ.get("DEV_AUTH_ID_SHA256", "").strip().lower()
+AUTH_CODE_SHA256 = os.environ.get("DEV_AUTH_CODE_SHA256", "").strip().lower()
+AUTH_CARD_IDS = tuple(
+    card.strip() for card in os.environ.get("DEV_AUTH_CARD_IDS", "").split("|") if card.strip()
+)
+AUTH_PROFILE = os.environ.get("DEV_AUTH_PROFILE", "development-test")
+AUTH_COOKIE_NAME = "parking_auth"
+AUTH_SESSION_TTL_SEC = max(300, int(os.environ.get("DEV_AUTH_SESSION_TTL_SEC", "1800")))
+AUTH_COOKIE_SECURE = _env_bool("DEV_AUTH_COOKIE_SECURE", True)
+AUTH_RATE_LIMIT_PER_IP = 5
+AUTH_RATE_LIMIT_WINDOW_SEC = 900
+
 _ip_requests = defaultdict(deque)
+_auth_requests = defaultdict(deque)
 _daily_count = {"date": None, "count": 0}
 
 app = FastAPI(title="信用卡停車優惠地圖")
@@ -70,25 +95,28 @@ def _haversine_km(lat1, lon1, lat2, lon2):
     return 2 * 6371 * asin(sqrt(a))
 
 
-def _eligible_lots():
+def _eligible_lots(card_ids=None):
     data = _load()
+    allowed_cards = set(data.get("benefit_rules", {}).get("eligible_cards", []))
+    if card_ids is not None and not (allowed_cards & set(card_ids)):
+        return []
     lots = data.get("parking_lots", [])
     return [l for l in lots if l.get("ctbc_eligible")]
 
 
-def _search_by_location(loc: str, limit: int = 12):
+def _search_by_location(loc: str, limit: int = 12, card_ids=None):
     def hay(l):
         return "".join(
             [l.get("city", ""), l.get("district", ""), l.get("address", ""), l.get("name", "")]
         )
 
-    matches = [l for l in _eligible_lots() if loc in hay(l)]
+    matches = [l for l in _eligible_lots(card_ids) if loc in hay(l)]
     total_found = len(matches)
     return total_found, matches[:limit]
 
 
-def _search_nearby(lat: float, lng: float, radius_km: float = 3.0, limit: int = 12):
-    lots = _eligible_lots()
+def _search_nearby(lat: float, lng: float, radius_km: float = 3.0, limit: int = 12, card_ids=None):
+    lots = _eligible_lots(card_ids)
     with_coords = [
         l for l in lots
         if l.get("latitude") not in (None, "", 0) and l.get("longitude") not in (None, "", 0)
@@ -182,9 +210,155 @@ def _lots_summary_text(total_found, shown_count, extra=""):
 
 # ---------------- API ----------------
 
+def _auth_configured():
+    return bool(
+        re.fullmatch(r"[0-9a-f]{64}", AUTH_ID_SHA256)
+        and re.fullmatch(r"[0-9a-f]{64}", AUTH_CODE_SHA256)
+        and len(AUTH_SESSION_SECRET) >= 32
+        and AUTH_CARD_IDS
+    )
+
+
+def _normalize_id_number(value):
+    return re.sub(r"[\s-]", "", str(value or "")).upper()
+
+
+def _hash_secret(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _cookie_secure(request: Request):
+    return AUTH_COOKIE_SECURE
+
+
+def _make_session():
+    payload = {
+        "profile": AUTH_PROFILE,
+        "exp": int(time.time()) + AUTH_SESSION_TTL_SEC,
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).rstrip(b"=").decode("ascii")
+    signature = hmac.new(
+        AUTH_SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return f"{encoded}.{signature}"
+
+
+def _read_session(request: Request):
+    if not AUTH_SESSION_SECRET:
+        return None
+    raw = request.cookies.get(AUTH_COOKIE_NAME, "")
+    try:
+        encoded, signature = raw.split(".", 1)
+        expected = hmac.new(
+            AUTH_SESSION_SECRET.encode("utf-8"), encoded.encode("ascii"), hashlib.sha256
+        ).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if int(payload.get("exp", 0)) <= int(time.time()):
+            return None
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+
+
+def _auth_guard(request: Request):
+    if not AUTH_REQUIRED:
+        return None
+    if not _auth_configured():
+        return JSONResponse(
+            {"authenticated": False, "auth_required": True,
+             "reply": "開發認證尚未完成環境設定，請聯絡服務管理者。"},
+            status_code=503,
+        )
+    if _read_session(request) is None:
+        return JSONResponse(
+            {"authenticated": False, "auth_required": True,
+             "reply": "請先完成身分驗證，再查詢停車優惠。"},
+            status_code=401,
+        )
+    return None
+
+
+def _check_auth_rate_limit(ip: str):
+    now = time.time()
+    q = _auth_requests[ip]
+    while q and now - q[0] > AUTH_RATE_LIMIT_WINDOW_SEC:
+        q.popleft()
+    if len(q) >= AUTH_RATE_LIMIT_PER_IP:
+        return False
+    q.append(now)
+    return True
+
+
+def _request_card_ids():
+    return AUTH_CARD_IDS if AUTH_CARD_IDS else None
+
+
+@app.get("/api/auth/status")
+def api_auth_status(request: Request):
+    session = _read_session(request)
+    authenticated = not AUTH_REQUIRED or session is not None
+    return {
+        "authenticated": authenticated,
+        "auth_required": AUTH_REQUIRED,
+        "configured": (not AUTH_REQUIRED) or _auth_configured(),
+        "expires_at": session.get("exp") if session else None,
+    }
+
+
+@app.post("/api/auth/login")
+async def api_auth_login(request: Request):
+    if not AUTH_REQUIRED:
+        return {"authenticated": True, "auth_required": False}
+    if not _auth_configured():
+        return JSONResponse({"reply": "開發認證尚未完成環境設定，請聯絡服務管理者。"}, status_code=503)
+
+    ip = request.client.host if request.client else "unknown"
+    if not _check_auth_rate_limit(ip):
+        return JSONResponse({"reply": "驗證嘗試太頻繁，請稍後再試。"}, status_code=429)
+
+    body = await request.json()
+    id_number = _normalize_id_number(body.get("id_number"))
+    verification_code = str(body.get("verification_code") or "").strip()
+    # 這是開發測試閘門，不做正式身分證檢核碼驗證；正式上線時應改接合規驗證服務。
+    if not re.fullmatch(r"[A-Z][0-9]{8,9}", id_number) or not re.fullmatch(r"[A-Za-z0-9-]{4,64}", verification_code):
+        return JSONResponse({"reply": "身分證字號或驗證碼格式不正確。"}, status_code=400)
+
+    valid_id = hmac.compare_digest(_hash_secret(id_number), AUTH_ID_SHA256)
+    valid_code = hmac.compare_digest(_hash_secret(verification_code), AUTH_CODE_SHA256)
+    if not (valid_id and valid_code):
+        return JSONResponse({"reply": "身分驗證失敗，請確認輸入內容。"}, status_code=401)
+
+    response = JSONResponse({"authenticated": True, "auth_required": True,
+                             "reply": "驗證成功，現在可以查詢符合您測試卡別的停車優惠。"})
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        _make_session(),
+        max_age=AUTH_SESSION_TTL_SEC,
+        httponly=True,
+        secure=_cookie_secure(request),
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout():
+    response = JSONResponse({"authenticated": False})
+    response.delete_cookie(AUTH_COOKIE_NAME, path="/")
+    return response
+
 @app.get("/api/search")
-def api_search(location: str = Query(..., min_length=1), limit: int = 20):
-    total_found, matches = _search_by_location(location.strip(), limit)
+def api_search(request: Request, location: str = Query(..., min_length=1), limit: int = 20):
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    total_found, matches = _search_by_location(location.strip(), limit, _request_card_ids())
     return JSONResponse(
         {"mode": "by_location_text", "query": location, "total_found": total_found,
          "shown": len(matches), "lots": matches}
@@ -192,8 +366,11 @@ def api_search(location: str = Query(..., min_length=1), limit: int = 20):
 
 
 @app.get("/api/nearby")
-def api_nearby(lat: float, lng: float, radius_km: float = 3.0, limit: int = 20):
-    total_found, matches, missing_coords = _search_nearby(lat, lng, radius_km, limit)
+def api_nearby(request: Request, lat: float, lng: float, radius_km: float = 3.0, limit: int = 20):
+    guard = _auth_guard(request)
+    if guard:
+        return guard
+    total_found, matches, missing_coords = _search_nearby(lat, lng, radius_km, limit, _request_card_ids())
     return JSONResponse(
         {"mode": "by_geolocation", "user_lat": lat, "user_lng": lng, "radius_km": radius_km,
          "total_found": total_found, "shown": len(matches), "lots": matches,
@@ -203,6 +380,9 @@ def api_nearby(lat: float, lng: float, radius_km: float = 3.0, limit: int = 20):
 
 @app.post("/api/chat")
 async def api_chat(request: Request):
+    guard = _auth_guard(request)
+    if guard:
+        return guard
     body = await request.json()
     message = (body.get("message") or "")[:MAX_MESSAGE_LEN]
     ip = request.client.host if request.client else "unknown"
@@ -227,7 +407,7 @@ async def api_chat(request: Request):
     if not loc:
         return JSONResponse({"reply": "請問您想查詢哪個地點呢？", "lots": None, "need_geolocation": False})
 
-    total_found, matches = _search_by_location(loc)
+    total_found, matches = _search_by_location(loc, card_ids=_request_card_ids())
     return JSONResponse({
         "reply": _lots_summary_text(total_found, len(matches)),
         "lots": matches,
@@ -238,6 +418,9 @@ async def api_chat(request: Request):
 
 @app.post("/api/chat/geolocation")
 async def api_chat_geolocation(request: Request):
+    guard = _auth_guard(request)
+    if guard:
+        return guard
     body = await request.json()
     lat = body.get("lat")
     lng = body.get("lng")
@@ -250,7 +433,9 @@ async def api_chat_geolocation(request: Request):
     if lat is None or lng is None:
         return JSONResponse({"reply": "沒有取得有效的定位座標，請改用文字告訴我地點。", "lots": None})
 
-    total_found, matches, missing_coords = _search_nearby(float(lat), float(lng))
+    total_found, matches, missing_coords = _search_nearby(
+        float(lat), float(lng), card_ids=_request_card_ids()
+    )
     extra = f"（另有 {missing_coords} 筆符合資格但缺少座標的場站，只能用文字地點查詢找到。）" if missing_coords else ""
     return JSONResponse({
         "reply": _lots_summary_text(total_found, len(matches), extra),
@@ -259,10 +444,13 @@ async def api_chat_geolocation(request: Request):
 
 
 @app.get("/api/stats")
-def api_stats():
+def api_stats(request: Request):
+    guard = _auth_guard(request)
+    if guard:
+        return guard
     data = _load()
     lots = data.get("parking_lots", [])
-    eligible = [l for l in lots if l.get("ctbc_eligible")]
+    eligible = _eligible_lots(_request_card_ids())
     with_coords = [
         l for l in eligible
         if l.get("latitude") not in (None, "", 0) and l.get("longitude") not in (None, "", 0)
@@ -293,6 +481,16 @@ INDEX_HTML = """<!DOCTYPE html>
   header { padding: 16px; border-bottom: 1px solid #e7e5e4; background: #fff; }
   header h1 { font-size: 1.1em; margin: 0 0 2px; }
   header p { color: #78716c; font-size: 0.8em; margin: 0; line-height: 1.4; }
+  .auth-panel { margin: 14px 16px 0; padding: 14px; border: 1px solid #d6d3d1; border-radius: 14px; background: #fff; }
+  .auth-panel h2 { margin: 0 0 5px; font-size: 0.95em; }
+  .auth-panel p { margin: 0 0 10px; color: #78716c; font-size: 0.78em; line-height: 1.45; }
+  .auth-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 7px; }
+  .auth-form input { min-width: 0; padding: 9px 10px; border: 1px solid #d6d3d1; border-radius: 8px; font-size: 0.86em; }
+  .auth-form button, .auth-logout { padding: 9px 12px; border: none; border-radius: 8px; background: #176d5f; color: #fff; cursor: pointer; font-weight: 600; }
+  .auth-logout { display: none; background: #78716c; font-size: 0.78em; }
+  .auth-status { margin-top: 7px; color: #78716c; font-size: 0.78em; }
+  .auth-status.error { color: #b91c1c; }
+  @media (max-width: 560px) { .auth-form { grid-template-columns: 1fr 1fr; } .auth-form button { grid-column: 1 / -1; } }
   .messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 14px; }
   .msg { display: flex; }
   .msg.user { justify-content: flex-end; }
@@ -374,8 +572,20 @@ INDEX_HTML = """<!DOCTYPE html>
 <div class="app">
   <header>
     <h1>🅿️ 信用卡停車優惠小助理</h1>
-    <p>用聊天的方式問我地點，或直接用您目前的位置查詢附近符合中信信用卡停車優惠資格的合作停車場。</p>
+    <p>完成開發測試認證後，依測試帳號對應的卡別查詢附近停車優惠。</p>
   </header>
+
+  <section class="auth-panel" id="authPanel">
+    <h2>開發測試認證</h2>
+    <p>身分證字號與驗證碼只用於本次測試驗證，不會顯示在聊天內容中。</p>
+    <form class="auth-form" id="authForm">
+      <input type="text" id="idNumber" inputmode="text" autocomplete="off" placeholder="身分證字號" maxlength="10" required>
+      <input type="password" id="verificationCode" autocomplete="one-time-code" placeholder="驗證碼" maxlength="64" required>
+      <button type="submit" id="authBtn">開始驗證</button>
+    </form>
+    <button type="button" class="auth-logout" id="logoutBtn">登出測試帳號</button>
+    <div class="auth-status" id="authStatus"></div>
+  </section>
 
   <div class="messages" id="messages"></div>
 
@@ -395,6 +605,15 @@ INDEX_HTML = """<!DOCTYPE html>
 const messagesEl = document.getElementById('messages');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('sendBtn');
+const authPanel = document.getElementById('authPanel');
+const authForm = document.getElementById('authForm');
+const idNumberEl = document.getElementById('idNumber');
+const verificationCodeEl = document.getElementById('verificationCode');
+const authBtn = document.getElementById('authBtn');
+const logoutBtn = document.getElementById('logoutBtn');
+const authStatusEl = document.getElementById('authStatus');
+let authenticated = false;
+let authRequired = true;
 
 function escapeHtml(s) {
   const d = document.createElement('div');
@@ -427,6 +646,107 @@ function removeTyping() {
   const el = document.getElementById('typing-indicator');
   if (el) el.remove();
 }
+
+function setQueryEnabled(enabled) {
+  inputEl.disabled = !enabled;
+  sendBtn.disabled = !enabled;
+  document.querySelectorAll('.quick-actions button').forEach(btn => { btn.disabled = !enabled; });
+}
+
+function setAuthStatus(text, isError = false) {
+  authStatusEl.textContent = text || '';
+  authStatusEl.className = 'auth-status' + (isError ? ' error' : '');
+}
+
+function showAuthenticated() {
+  authForm.style.display = 'none';
+  logoutBtn.style.display = 'inline-block';
+  setAuthStatus('已完成開發測試認證，可以查詢符合測試卡別的優惠。');
+  setQueryEnabled(true);
+}
+
+function showLogin(message) {
+  authForm.style.display = '';
+  logoutBtn.style.display = 'none';
+  setAuthStatus(message || '請先完成開發測試認證。', !!message);
+  setQueryEnabled(false);
+}
+
+async function loadStats() {
+  try {
+    const res = await fetch('/api/stats');
+    if (!res.ok) return;
+    const s = await res.json();
+    document.getElementById('footerStats').innerHTML =
+      `資料庫共 ${s.total_lots} 筆場站，${s.eligible_lots} 筆符合您測試卡別的優惠資格。資料來源：` +
+      `<a href="https://help.carmochi.com/cityparking/available" target="_blank" rel="noopener">help.carmochi.com</a>`;
+  } catch (e) {}
+}
+
+async function refreshAuth() {
+  try {
+    const res = await fetch('/api/auth/status');
+    const data = await res.json();
+    authRequired = !!data.auth_required;
+    if (!authRequired) {
+      authPanel.style.display = 'none';
+      authenticated = true;
+      setQueryEnabled(true);
+      addMessage('assistant', '嗨！我可以幫您查詢符合信用卡停車優惠資格的合作停車場。可以直接告訴我地點，或說「附近」。');
+      loadStats();
+      return;
+    }
+    if (!data.configured) {
+      showLogin('服務尚未完成開發認證設定，請聯絡管理者。');
+      authBtn.disabled = true;
+      return;
+    }
+    if (data.authenticated) {
+      authenticated = true;
+      showAuthenticated();
+      addMessage('assistant', '驗證已生效！可以告訴我地點，或說「附近」查詢符合測試卡別的停車優惠。');
+      loadStats();
+    } else {
+      showLogin('請先完成開發測試認證。');
+    }
+  } catch (e) {
+    showLogin('無法確認認證狀態，請稍後再試。');
+  }
+}
+
+authForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  authBtn.disabled = true;
+  setAuthStatus('正在驗證…');
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id_number: idNumberEl.value, verification_code: verificationCodeEl.value }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showLogin(data.reply || '驗證失敗，請稍後再試。');
+      return;
+    }
+    authenticated = true;
+    idNumberEl.value = '';
+    verificationCodeEl.value = '';
+    showAuthenticated();
+    addMessage('assistant', data.reply || '驗證成功，現在可以查詢停車優惠。');
+    loadStats();
+  } catch (e) {
+    showLogin('驗證服務暫時無法使用，請稍後再試。');
+  } finally {
+    authBtn.disabled = false;
+  }
+});
+
+logoutBtn.addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+  authenticated = false;
+  showLogin('已登出，請重新完成開發測試認證。');
+});
 
 function renderCardsInto(bubble, lots) {
   if (!lots || !lots.length) return;
@@ -499,6 +819,11 @@ function requestGeolocation() {
       });
       const data = await res.json();
       removeTyping();
+      if (res.status === 401 || res.status === 503) {
+        authenticated = false;
+        showLogin(data.reply || '請先完成開發測試認證。');
+        return;
+      }
       const bubble = addMessage('assistant', data.reply || '');
       renderCardsInto(bubble, data.lots);
     } catch (e) {
@@ -512,6 +837,10 @@ function requestGeolocation() {
 
 async function sendMessage(text) {
   if (!text.trim()) return;
+  if (authRequired && !authenticated) {
+    showLogin('請先完成開發測試認證。');
+    return;
+  }
   addMessage('user', text);
   inputEl.value = '';
   sendBtn.disabled = true;
@@ -524,6 +853,11 @@ async function sendMessage(text) {
     });
     const data = await res.json();
     removeTyping();
+    if (res.status === 401 || res.status === 503) {
+      authenticated = false;
+      showLogin(data.reply || '請先完成開發測試認證。');
+      return;
+    }
     if (data.need_geolocation) {
       requestGeolocation();
     } else {
@@ -544,13 +878,8 @@ document.querySelectorAll('.quick-actions button').forEach(btn => {
   btn.addEventListener('click', () => sendMessage(btn.dataset.msg));
 });
 
-addMessage('assistant', '嗨！我可以幫您查詢符合中信信用卡停車優惠資格的合作停車場。可以直接告訴我地點，或說「附近」讓我用您目前的位置查詢。');
-
-fetch('/api/stats').then(r => r.json()).then(s => {
-  document.getElementById('footerStats').innerHTML =
-    `資料庫共 ${s.total_lots} 筆場站，${s.eligible_lots} 筆符合信用卡優惠資格。資料來源：` +
-    `<a href="https://help.carmochi.com/cityparking/available" target="_blank" rel="noopener">help.carmochi.com</a>`;
-}).catch(() => {});
+setQueryEnabled(false);
+refreshAuth();
 </script>
 </body>
 </html>"""
