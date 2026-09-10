@@ -35,7 +35,7 @@ INTENT_SYSTEM_PROMPT = """你是一個信用卡停車優惠查詢助理的意圖
 {"intent": "unclear", "clarify": "一句簡短的中文澄清問句"}
 
 規則：
-- 如果使用者提到具體地名/城市/行政區（例如「信義區「「台北車站附近」「基隆」），回傳 search_location，location 只填地點關鍵字本身。
+- 如果使用者提到具體地名/城市/行政區（例如「信義區」「台北車站附近」「基隆」），回傳 search_location，location 只填地點關鍵字本身。
 - 如果使用者說「附近」「我這裡」「目前位置」「我的位置」等但沒給具體地名，回傳 use_geolocation。
 - 如果訊息含糊、無法判斷地點（例如打招呼、問其他不相關問題），回傳 unclear，並給一句簡短澄清問句。
 - 只回傳 JSON，不要任何額外說明文字。"""
@@ -312,21 +312,37 @@ INDEX_HTML = """<!DOCTYPE html>
   .typing span:nth-child(2) { animation-delay: 0.2s; }
   .typing span:nth-child(3) { animation-delay: 0.4s; }
   @keyframes blink { 0%, 80%, 100% { opacity: 0.25; } 40% { opacity: 1; } }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 10px; }
-  .lot {
-    background: #fafaf9; border: 1px solid #e7e5e4; border-radius: 10px; padding: 10px 12px;
+  .pk-carousel { display: grid; grid-template-columns: auto 1fr auto; gap: 6px; align-items: center; margin-top: 10px; }
+  .pk-arrow {
+    width: 28px; height: 28px; border-radius: 50%; border: 1px solid #e7e5e4; background: #fff;
+    font-size: 15px; cursor: pointer; flex-shrink: 0;
   }
-  .lot-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
-  .badge {
-    font-size: 0.68em; font-weight: 600; color: #15803d; background: #dcfce7;
-    padding: 1px 7px; border-radius: 999px;
+  .pk-carousel article {
+    display: grid; grid-template-columns: 92px 1fr; border: 1px solid #e7e5e4; border-radius: 12px;
+    overflow: hidden; min-height: 116px; background: #fafaf9;
   }
-  .op { font-size: 0.68em; color: #a8a29e; }
-  .lot h3 { font-size: 0.88em; margin: 3px 0 2px; line-height: 1.3; }
-  .addr { font-size: 0.78em; color: #57534e; margin: 0 0 3px; line-height: 1.4; }
-  .dist { font-size: 0.75em; color: #2563eb; margin: 0 0 4px; }
-  .maps { font-size: 0.78em; color: #2563eb; text-decoration: none; }
-  .maps:hover { text-decoration: underline; }
+  .pk-visual {
+    display: grid; place-content: center; justify-items: center; gap: 4px; color: #fff;
+    background: linear-gradient(145deg, #176d5f, #24a69a);
+  }
+  .pk-visual span {
+    display: grid; width: 40px; height: 40px; place-items: center; border: 3px solid #fff;
+    border-radius: 10px; font-size: 22px; font-weight: 900; line-height: 1;
+  }
+  .pk-visual small { font-size: 9px; font-weight: 700; padding: 0 4px; text-align: center; }
+  .pk-copy { padding: 9px 11px; display: grid; gap: 2px; align-content: center; min-width: 0; }
+  .pk-badge { font-size: 0.68em; font-weight: 700; color: #15803d; }
+  .pk-copy h3 { margin: 0; font-size: 0.92em; line-height: 1.3; }
+  .pk-copy p { margin: 0; color: #78716c; font-size: 0.78em; line-height: 1.4; }
+  .pk-dist { color: #2563eb !important; }
+  .pk-copy a { color: #2563eb; font-size: 0.8em; font-weight: 600; text-decoration: none; }
+  .pk-copy a:hover { text-decoration: underline; }
+  .pk-page {
+    display: flex; gap: 6px; align-items: center; justify-content: center; margin-top: 6px;
+    font-size: 0.72em; color: #a8a29e;
+  }
+  .pk-page i { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: #d6d3d1; margin: 0 1px; }
+  .pk-page i.on { background: #176d5f; }
   .composer {
     display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #e7e5e4; background: #fff;
   }
@@ -407,21 +423,49 @@ function removeTyping() {
 
 function renderCardsInto(bubble, lots) {
   if (!lots || !lots.length) return;
-  const grid = document.createElement('div');
-  grid.className = 'cards';
-  grid.innerHTML = lots.map(l => `
-    <article class="lot">
-      <div class="lot-top">
-        <span class="badge">✓ 符合資格</span>
-        <span class="op">${escapeHtml(l.operator || '')}</span>
+  const cid = 'pk' + Math.random().toString(36).slice(2, 7);
+  let idx = 0;
+
+  const wrap = document.createElement('div');
+  wrap.id = cid;
+  wrap.innerHTML = `
+    <div class="pk-carousel">
+      <button type="button" class="pk-arrow" data-prev aria-label="上一個">‹</button>
+      <article data-card></article>
+      <button type="button" class="pk-arrow" data-next aria-label="下一個">›</button>
+    </div>
+    <div class="pk-page"><strong data-idx></strong><span data-dots></span></div>
+  `;
+  bubble.appendChild(wrap);
+
+  const distLabel = (l) => {
+    if (l.distance_km == null) return '';
+    const km = l.distance_km;
+    return km < 1 ? Math.round(km * 1000) + ' 公尺' : km.toFixed(1) + ' 公里';
+  };
+
+  const draw = () => {
+    const l = lots[idx % lots.length];
+    wrap.querySelector('[data-card]').innerHTML = `
+      <div class="pk-visual"><span>P</span><small>${escapeHtml(l.operator || '合作停車場')}</small></div>
+      <div class="pk-copy">
+        <span class="pk-badge">✓ 符合信用卡優惠資格</span>
+        <h3>${escapeHtml(l.name || '(未命名場站)')}</h3>
+        <p>${escapeHtml(l.address || '')}</p>
+        ${l.distance_km != null ? `<p class="pk-dist">📍 距離約 ${distLabel(l)}</p>` : ''}
+        ${l.google_maps_url ? `<a href="${l.google_maps_url}" target="_blank" rel="noopener">導航前往 ↗</a>` : ''}
       </div>
-      <h3>${escapeHtml(l.name || '(未命名場站)')}</h3>
-      <p class="addr">${escapeHtml(l.address || '')}</p>
-      ${l.distance_km != null ? `<p class="dist">📍 距離約 ${l.distance_km < 1 ? Math.round(l.distance_km*1000)+' 公尺' : l.distance_km.toFixed(1)+' 公里'}</p>` : ''}
-      ${l.google_maps_url ? `<a class="maps" href="${l.google_maps_url}" target="_blank" rel="noopener">導航前往 ↗</a>` : ''}
-    </article>
-  `).join('');
-  bubble.appendChild(grid);
+    `;
+    wrap.querySelector('[data-idx]').textContent = `${(idx % lots.length) + 1} / ${lots.length}`;
+    const dotCount = Math.min(lots.length, 8);
+    wrap.querySelector('[data-dots]').innerHTML = Array.from({ length: dotCount }, (_, i) =>
+      `<i class="${i === idx % dotCount ? 'on' : ''}"></i>`
+    ).join('');
+  };
+
+  wrap.querySelector('[data-prev]').onclick = () => { idx = (idx - 1 + lots.length) % lots.length; draw(); };
+  wrap.querySelector('[data-next]').onclick = () => { idx = (idx + 1) % lots.length; draw(); };
+  draw();
 }
 
 function requestGeolocation() {
