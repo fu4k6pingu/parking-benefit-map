@@ -343,6 +343,13 @@ INDEX_HTML = """<!DOCTYPE html>
   }
   .pk-page i { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: #d6d3d1; margin: 0 1px; }
   .pk-page i.on { background: #176d5f; }
+  .pk-evidence { margin: 2px 0 0; }
+  .pk-evidence summary { color: #176d5f; font-size: 0.72em; font-weight: 700; cursor: pointer; list-style: none; }
+  .pk-evidence summary::-webkit-details-marker { display: none; }
+  .pk-evidence summary::before { content: '▸ '; }
+  .pk-evidence[open] summary::before { content: '▾ '; }
+  .pk-evidence div { margin-top: 4px; font-size: 0.72em; color: #78716c; line-height: 1.5; }
+  .pk-evidence a { color: #2563eb; }
   .composer {
     display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid #e7e5e4; background: #fff;
   }
@@ -435,6 +442,7 @@ function renderCardsInto(bubble, lots) {
       <button type="button" class="pk-arrow" data-next aria-label="下一個">›</button>
     </div>
     <div class="pk-page"><strong data-idx></strong><span data-dots></span></div>
+    <details class="pk-evidence" data-evidence></details>
   `;
   bubble.appendChild(wrap);
 
@@ -461,6 +469,13 @@ function renderCardsInto(bubble, lots) {
     wrap.querySelector('[data-dots]').innerHTML = Array.from({ length: dotCount }, (_, i) =>
       `<i class="${i === idx % dotCount ? 'on' : ''}"></i>`
     ).join('');
+    const evEl = wrap.querySelector('[data-evidence]');
+    if (l.eligibility_evidence) {
+      evEl.innerHTML = `<summary>查看資格依據</summary><div>${escapeHtml(l.eligibility_evidence)}${l.source_url ? ` — <a href="${l.source_url}" target="_blank" rel="noopener">來源 ↗</a>` : ''}</div>`;
+      evEl.style.display = '';
+    } else {
+      evEl.style.display = 'none';
+    }
   };
 
   wrap.querySelector('[data-prev]').onclick = () => { idx = (idx - 1 + lots.length) % lots.length; draw(); };
