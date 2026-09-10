@@ -597,8 +597,8 @@ INDEX_HTML = """<!DOCTYPE html>
     <h2>開發測試認證</h2>
     <p>身分證字號與驗證碼只用於本次測試驗證，不會顯示在聊天內容中。</p>
     <form class="auth-form" id="authForm">
-      <input type="text" id="idNumber" inputmode="text" autocomplete="off" placeholder="身分證字號" maxlength="10" required>
-      <input type="password" id="verificationCode" autocomplete="one-time-code" placeholder="驗證碼" maxlength="64" required>
+       <input type="text" id="idNumber" inputmode="text" autocomplete="off" placeholder="身分證字號，例如 A123456789" maxlength="10" required>
+       <input type="password" id="verificationCode" autocomplete="one-time-code" placeholder="驗證碼，例如 246810" maxlength="64" required>
       <button type="submit" id="authBtn">開始驗證</button>
     </form>
     <button type="button" class="auth-logout" id="logoutBtn">登出測試帳號</button>
